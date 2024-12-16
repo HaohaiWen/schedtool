@@ -1,0 +1,91 @@
+From 74227952c6472226221c1bb138767800c373b9a8 Mon Sep 17 00:00:00 2001
+From: Haohai Wen <haohai.wen@intel.com>
+Date: Wed, 23 Mar 2022 13:34:18 +0800
+Subject: [PATCH] Dump eosz and operand's xtype,width when verbosity is greater
+ than 3
+
+---
+ include/public/xed/xed-inst.h | 2 +-
+ src/dec/xed-disas.c           | 9 ++++++++-
+ src/dec/xed-inst.c            | 9 ++++++++-
+ 3 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/include/public/xed/xed-inst.h b/include/public/xed/xed-inst.h
+index d0c6e69..9095f73 100644
+--- a/include/public/xed/xed-inst.h
++++ b/include/public/xed/xed-inst.h
+@@ -178,7 +178,7 @@ static XED_INLINE xed_uint32_t xed_operand_imm(const xed_operand_t* p) {
+ /// @param buf buffer that gets filled in
+ /// @param buflen maximum buffer length
+ XED_DLL_EXPORT void
+-xed_operand_print(const xed_operand_t* p, char* buf, int buflen);
++xed_operand_print(const xed_operand_t* p, char* buf, int buflen, const xed_uint32_t eosz);
+ //@}
+ 
+ /// @name xed_inst_t Template Operand Enum Name Classification
+diff --git a/src/dec/xed-disas.c b/src/dec/xed-disas.c
+index d533390..2bed3d9 100644
+--- a/src/dec/xed-disas.c
++++ b/src/dec/xed-disas.c
+@@ -160,16 +160,23 @@ xed_decoded_inst_dump(const xed_decoded_inst_t* p, char* buf, int buflen)
+ 
+     blen = xed_strncat(buf,"\n",blen);
+     noperands = xed_inst_noperands(xi);
++
++    const xed_uint32_t eosz = xed3_operand_get_eosz(p);
+     for( i=0;i<noperands;i++) {
+         const xed_operand_t* op;
+         t = buf+xed_strlen(buf);
+         op = xed_inst_operand(xi,i);
+         blen = xed_itoa(t,i,blen);
+         blen = xed_strncat(buf,"\t\t",blen);
+-        xed_operand_print(op,buf+xed_strlen(buf),blen);
++        xed_operand_print(op,buf+xed_strlen(buf),blen,eosz);
+         blen = buffer_remains(buflen,buf);
+         blen = xed_strncat(buf,"\n",blen);
+     }
++    char tmp_buf[4];
++    xed_sprintf_uint32(tmp_buf,eosz,4);
++    blen = xed_strncat(buf,"EOSZ:\t",blen);
++    blen = xed_strncat(buf,tmp_buf, blen);
++    blen = xed_strncat(buf,"\n",blen);
+ 
+     okay = xed_format_context(XED_SYNTAX_INTEL,
+                               p,ibuf,sizeof(ibuf),0,0,0);
+diff --git a/src/dec/xed-inst.c b/src/dec/xed-inst.c
+index 8f3d299..78bf917 100644
+--- a/src/dec/xed-inst.c
++++ b/src/dec/xed-inst.c
+@@ -25,6 +25,7 @@ END_LEGAL */
+ #include "xed-portability.h"
+ #include "xed-tables-extern.h"
+ #include "xed-operand-action.h"
++#include "xed-util-private.h"
+ 
+ 
+ const xed_inst_t* xed_inst_table_base(void) {
+@@ -94,7 +95,7 @@ xed_uint32_t xed_inst_flag_info_index(const xed_inst_t* p) {
+ }
+ 
+ 
+-void xed_operand_print(const xed_operand_t* p, char* buf, int buflen) {
++void xed_operand_print(const xed_operand_t* p, char* buf, int buflen, const xed_uint32_t eosz) {
+     int blen = buflen;
+     blen = xed_strncpy(buf,xed_operand_enum_t2str(p->_name),blen);
+     blen = xed_strncat(buf,"/",blen);
+@@ -122,6 +123,12 @@ void xed_operand_print(const xed_operand_t* p, char* buf, int buflen) {
+                            xed_nonterminal_enum_t2str(xed_operand_nt_lookup_fn_enum(p)),
+                            blen);
+     }
++    char tmp_buf[16];
++    blen = xed_strncat(buf,"/",blen);
++    blen = xed_strncat(buf,xed_operand_element_xtype_enum_t2str(p->_xtype),blen);
++    blen = xed_strncat(buf,"/",blen);
++    xed_sprintf_uint32(tmp_buf,xed_operand_width_bits(p, eosz),16);
++    blen = xed_strncat(buf,tmp_buf,blen);
+ }
+ 
+ unsigned int xed_attribute_max(void) {
+-- 
+2.29.2
+

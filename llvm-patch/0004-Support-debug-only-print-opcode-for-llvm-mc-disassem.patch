@@ -1,0 +1,61 @@
+From 51712091c90c1e0e6b600aadc440750cb208b63a Mon Sep 17 00:00:00 2001
+From: Haohai Wen <haohai.wen@intel.com>
+Date: Wed, 23 Mar 2022 17:16:56 +0800
+Subject: [PATCH 4/4] Support -debug-only=print-opcode for llvm-mc disassembler
+
+---
+ llvm/tools/llvm-mc/Disassembler.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/llvm/tools/llvm-mc/Disassembler.cpp b/llvm/tools/llvm-mc/Disassembler.cpp
+index 7456a2f2c915..6efce1f57e70 100644
+--- a/llvm/tools/llvm-mc/Disassembler.cpp
++++ b/llvm/tools/llvm-mc/Disassembler.cpp
+@@ -25,6 +25,8 @@
+ #include "llvm/Support/SourceMgr.h"
+ #include "llvm/Support/raw_ostream.h"
+ #include "llvm/TargetParser/Triple.h"
++#include "llvm/MC/MCInstrInfo.h"
++#include "llvm/Support/Debug.h"
+ 
+ using namespace llvm;
+ 
+@@ -35,7 +37,7 @@ static bool PrintInsts(const MCDisassembler &DisAsm,
+                        const ByteArrayTy &Bytes,
+                        SourceMgr &SM, raw_ostream &Out,
+                        MCStreamer &Streamer, bool InAtomicBlock,
+-                       const MCSubtargetInfo &STI) {
++                       const MCSubtargetInfo &STI, const MCInstrInfo &MCII) {
+   ArrayRef<uint8_t> Data(Bytes.first.data(), Bytes.first.size());
+ 
+   // Disassemble it to strings.
+@@ -68,6 +70,7 @@ static bool PrintInsts(const MCDisassembler &DisAsm,
+       [[fallthrough]];
+ 
+     case MCDisassembler::Success:
++      DEBUG_WITH_TYPE("print-opcode", outs() << MCII.getName(Inst.getOpcode()));
+       Streamer.emitInstruction(Inst, STI);
+       break;
+     }
+@@ -155,6 +158,9 @@ int Disassembler::disassemble(const Target &T, const std::string &Triple,
+     return -1;
+   }
+ 
++  std::unique_ptr<MCInstrInfo> MCII(T.createMCInstrInfo());
++  assert(MCII && "Unable to create instruction info!");
++
+   // Set up initial section manually here
+   Streamer.initSections(false, STI);
+ 
+@@ -194,7 +200,7 @@ int Disassembler::disassemble(const Target &T, const std::string &Triple,
+ 
+     if (!ByteArray.first.empty())
+       ErrorOccurred |= PrintInsts(*DisAsm, ByteArray, SM, Out, Streamer,
+-                                  InAtomicBlock, STI);
++                                  InAtomicBlock, STI, *MCII);
+   }
+ 
+   if (InAtomicBlock) {
+-- 
+2.18.1
+

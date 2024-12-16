@@ -1,0 +1,505 @@
+From 775767b265c0376b43b960ab5465cb663bc33736 Mon Sep 17 00:00:00 2001
+From: Haohai Wen <haohai.wen@intel.com>
+Date: Wed, 16 Mar 2022 14:45:36 +0800
+Subject: [PATCH 3/4] Add --gen-x86-inst-sched-info to emit x86 instruction
+ sched info
+
+---
+ llvm/utils/TableGen/AsmMatcherEmitter.cpp | 416 +++++++++++++++++++++-
+ 1 file changed, 411 insertions(+), 5 deletions(-)
+
+diff --git a/llvm/utils/TableGen/AsmMatcherEmitter.cpp b/llvm/utils/TableGen/AsmMatcherEmitter.cpp
+index 0b7d784844e2..7c2737fdf4b9 100644
+--- a/llvm/utils/TableGen/AsmMatcherEmitter.cpp
++++ b/llvm/utils/TableGen/AsmMatcherEmitter.cpp
+@@ -110,11 +110,13 @@
+ #include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/JSON.h"
+ #include "llvm/TableGen/Error.h"
+ #include "llvm/TableGen/Record.h"
+ #include "llvm/TableGen/StringMatcher.h"
+ #include "llvm/TableGen/StringToOffsetTable.h"
+ #include "llvm/TableGen/TableGenBackend.h"
++#include "X86RecognizableInstr.h"
+ #include <cassert>
+ #include <cctype>
+ #include <forward_list>
+@@ -750,6 +752,13 @@ public:
+   /// Map of RegisterClass records to their class information.
+   std::map<Record*, ClassInfo*> RegisterClassClasses;
+ 
++  // All instructions as InstAlias result.
++  using AliasResultsSetTy = DenseSet<const CodeGenInstruction *>;
++  std::unique_ptr<AliasResultsSetTy> AliasResultsSet;
++
++  // All CodeGenOnly but matchable instructions.
++  SmallVector<const CodeGenInstruction *> CodeGenOnlyInstrs;
++
+ private:
+   /// Map of token to class information which has already been constructed.
+   std::map<std::string, ClassInfo*> TokenClasses;
+@@ -782,7 +791,7 @@ public:
+                  RecordKeeper &Records);
+ 
+   /// Construct the various tables used during matching.
+-  void buildInfo();
++  void buildInfo(bool AllowX86NoPseudo=false);
+ 
+   /// buildOperandMatchInfo - Build the necessary information to handle user
+   /// defined operand parsing methods.
+@@ -1480,7 +1489,7 @@ void AsmMatcherInfo::buildOperandMatchInfo() {
+   }
+ }
+ 
+-void AsmMatcherInfo::buildInfo() {
++void AsmMatcherInfo::buildInfo(bool AllowX86NoPseudo) {
+   // Build information about all of the AssemblerPredicates.
+   const std::vector<std::pair<Record *, SubtargetFeatureInfo>>
+       &SubtargetFeaturePairs = SubtargetFeatureInfo::getAll(Records);
+@@ -1495,6 +1504,13 @@ void AsmMatcherInfo::buildInfo() {
+   bool ReportMultipleNearMisses =
+       AsmParser->getValueAsBit("ReportMultipleNearMisses");
+ 
++  // Collect all instruction alias results.
++  if (AllowX86NoPseudo && !AliasResultsSet) {
++    AliasResultsSet = std::make_unique<AliasResultsSetTy>();
++    for (Record *InstAlias : Records.getAllDerivedDefinitions("InstAlias"))
++      AliasResultsSet->insert(CodeGenInstAlias(InstAlias, Target).ResultInst);
++  }
++
+   // Parse the instructions; we need to do this first so that we can gather the
+   // singleton register classes.
+   SmallPtrSet<Record*, 16> SingletonRegisters;
+@@ -1522,8 +1538,33 @@ void AsmMatcherInfo::buildInfo() {
+         continue;
+ 
+       // Ignore "codegen only" instructions.
+-      if (CGI->TheDef->getValueAsBit("isCodeGenOnly"))
+-        continue;
++      // Collect X86 CodeGenOnly but not pseudo instructions.
++      if (CGI->TheDef->getValueAsBit("isCodeGenOnly")) {
++        if (!AllowX86NoPseudo || CGI->isPseudo)
++          continue;
++
++        if (!CommentDelimiter.empty() &&
++            StringRef(CGI->AsmString).contains(CommentDelimiter))
++          continue;
++
++        BitsInit *FormBits = CGI->TheDef->getValueAsBitsInit("FormBits");
++        uint8_t Width = FormBits->getNumBits();
++        uint8_t Form = 0, Mask = 1;
++        for (unsigned Index = 0; Index < Width; Index++) {
++          if (cast<BitInit>(FormBits->getBit(Index))->getValue())
++            Form |= Mask;
++          Mask <<= 1;
++        }
++
++        // Skip X86 pseudo and instructions as alias result.
++        if (Form == X86Local::Pseudo || AliasResultsSet->count(CGI))
++          continue;
++
++        if (CGI->TheDef->getValueAsBit("hasLockPrefix"))
++          continue;
++
++        CodeGenOnlyInstrs.push_back(CGI);
++      }
+ 
+       // Ignore instructions for different instructions
+       StringRef V = CGI->TheDef->getValueAsString("AsmVariantName");
+@@ -3207,7 +3248,7 @@ void AsmMatcherEmitter::run(raw_ostream &OS) {
+ 
+   // Compute the information on the instructions to match.
+   AsmMatcherInfo Info(AsmParser, Target, Records);
+-  Info.buildInfo();
++  Info.buildInfo(/*AllowX86NoPseudo=*/true);
+ 
+   // Sort the instruction table using the partial order on classes. We use
+   // stable_sort to ensure that ambiguous instructions are still
+@@ -3503,6 +3544,12 @@ void AsmMatcherEmitter::run(raw_ostream &OS) {
+ 
+   OS << "} // end anonymous namespace\n\n";
+ 
++  OS << "static const DenseSet<unsigned> CodeGenOnlySet = {\n";
++  for (const CodeGenInstruction *CGI : Info.CodeGenOnlyInstrs)
++    OS << "  " << Target.getInstNamespace() << "::" << CGI->TheDef->getName()
++       << ",\n";
++  OS << "};\n\n";
++
+   unsigned VariantCount = Target.getAsmParserVariantCount();
+   for (unsigned VC = 0; VC != VariantCount; ++VC) {
+     Record *AsmVariant = Target.getAsmParserVariant(VC);
+@@ -3660,6 +3707,11 @@ void AsmMatcherEmitter::run(raw_ostream &OS) {
+     OS << "    bool MultipleInvalidOperands = false;\n";
+   }
+ 
++  OS << "    if (!PrintOpcodes && CodeGenOnlySet.count(it->Opcode)) {\n";
++  OS << "      DEBUG_WITH_TYPE(\"asm-matcher\", dbgs() << \"Skip CodeGenOnly\\n\");\n";
++  OS << "      continue;\n";
++  OS << "    }\n\n";
++
+   if (HasMnemonicFirst) {
+     OS << "    // equal_range guarantees that instruction mnemonic matches.\n";
+     OS << "    assert(Mnemonic == it->getMnemonic());\n";
+@@ -4027,3 +4079,357 @@ void AsmMatcherEmitter::run(raw_ostream &OS) {
+ 
+ static TableGen::Emitter::OptClass<AsmMatcherEmitter>
+     X("gen-asm-matcher", "Generate assembly instruction matcher");
++
++//===---------- Customization to emit x86 inst sched info  ----------------===//
++
++// Global index to avoid using same regs on an instruction.
++static int RegIdx = 0;
++
++static std::string genRegisterEnum(CodeGenRegBank &RegBank,
++                                   const CGIOperandList::OperandInfo *OI) {
++  CodeGenRegisterClass *RC = nullptr;
++  StringRef PrintMethod = OI->PrinterMethodName;
++  if (OI->Rec->isSubClassOf("RegisterClass"))
++    RC = RegBank.getRegClass(OI->Rec);
++  else if (OI->Rec->isSubClassOf("RegisterOperand"))
++    RC = RegBank.getRegClass(OI->Rec->getValueAsDef("RegClass"));
++  else
++    llvm_unreachable("Unknown register class");
++
++  ArrayRef<const CodeGenRegister *> Members = RC->getMembers();
++  const CodeGenRegister *Reg = Members[RegIdx++ % Members.size()];
++  StringRef RegName = Reg->getName();
++  std::string Prefix = "%";
++  if (PrintMethod == "printOperand") {
++    return Prefix + RegName.lower();
++  } else if (PrintMethod == "printSTiRegOperand") {
++    return Prefix + RegName.lower().substr(0, 2) + '(' +
++           RegName.lower().substr(2) + ')';
++  } else if (PrintMethod == "printVKPair") {
++    if (RegName.compare_insensitive("k0_k1") == 0)
++      return Prefix + "k0";
++    else if (RegName.compare_insensitive("k2_k3") == 0)
++      return Prefix + "k2";
++    else if (RegName.compare_insensitive("k4_k5") == 0)
++      return Prefix + "k4";
++    else if (RegName.compare_insensitive("k6_k7") == 0)
++      return Prefix + "k6";
++    else
++      llvm_unreachable("Unknown k register");
++  } else {
++    std::string ErrMsg =
++        std::string("Unknown print method: ") + PrintMethod.str();
++    llvm_unreachable(ErrMsg.c_str());
++  }
++}
++
++static std::string genImmediateEnum(const CGIOperandList::OperandInfo *OI) {
++  unsigned ImmSize = OI->Rec->getValueAsDef("Type")->getValueAsInt("Size");
++  StringRef ValueName = OI->Rec->getName();
++
++  // Rewrite immsize for some operand type.
++  if (ValueName == "i64u8imm" || ValueName == "i64i8imm" ||
++      ValueName == "i32u8imm" || ValueName == "i32i8imm" ||
++      ValueName == "i16u8imm" || ValueName == "i16i8imm")
++    ImmSize = 8;
++  else if (ValueName == "i64i32imm")
++    ImmSize = 32;
++
++  switch (ImmSize) {
++  case 1:
++    return "$0x1";
++  case 8:
++    return "$0x01";
++  case 16:
++    return "$0x1234";
++  case 32:
++    return "$0x12345678";
++  case 64:
++    return "$0x123456789abcdef0";
++  default:
++    llvm_unreachable("Unknown ImmSize");
++  }
++}
++
++static std::string genMemoryEnum(const CGIOperandList::OperandInfo *OI) {
++  StringRef ValueName = OI->Rec->getName();
++  StringRef PrintMethod = OI->PrinterMethodName;
++  if (PrintMethod == "printbytemem")
++    return "(%esp)";
++  else if (PrintMethod == "printwordmem")
++    return "(%esp)";
++  else if (PrintMethod == "printdwordmem")
++    return "(%esp)";
++  else if (PrintMethod == "printqwordmem") {
++    if (ValueName == "vx64mem" || ValueName == "vx64xmem")
++      return "(%esp, %xmm15, 2)";
++    return "(%esp)";
++  } else if (PrintMethod == "printxmmwordmem") {
++    if (ValueName == "vx128mem" || ValueName == "vx128xmem")
++      return "(%esp, %xmm15, 2)";
++    if (ValueName == "vy128mem" || ValueName == "vy128xmem")
++      return "(%esp, %ymm15, 2)";
++    return "(%esp)";
++  } else if (PrintMethod == "printymmwordmem") {
++    if (ValueName == "vy256mem" || ValueName == "vy256xmem")
++      return "(%esp, %ymm15, 2)";
++    if (ValueName == "vx256mem" || ValueName == "vx256xmem")
++      return "(%esp, %xmm15, 2)";
++    if (ValueName == "vz256mem")
++      return "(%esp, %zmm15, 2)";
++    return "(%esp)";
++  } else if (PrintMethod == "printzmmwordmem") {
++    if (ValueName == "vy512xmem")
++      return "(%esp, %ymm15, 2)";
++    if (ValueName == "vz512mem")
++      return "(%esp, %zmm15, 2)";
++    if (ValueName == "i512mem_GR16")
++      return "(%si)";
++    if (ValueName == "i512mem_GR64")
++      return "(%rsp)";
++    return "(%esp)";
++  } else if (PrintMethod == "printtbytemem")
++    return "(%esp)";
++  else if (PrintMethod == "printMemReference")
++    return "(%esp)";
++  else if (PrintMethod == "printSrcIdx8")
++    return "(%esi)";
++  else if (PrintMethod == "printSrcIdx16")
++    return "(%esi)";
++  else if (PrintMethod == "printSrcIdx32")
++    return "(%esi)";
++  else if (PrintMethod == "printSrcIdx64")
++    return "(%esi)";
++  else if (PrintMethod == "printDstIdx8")
++    return "%es:(%edi)";
++  else if (PrintMethod == "printDstIdx16")
++    return "%es:(%edi)";
++  else if (PrintMethod == "printDstIdx32")
++    return "%es:(%edi)";
++  else if (PrintMethod == "printDstIdx64")
++    return "%es:(%edi)";
++  else if (PrintMethod == "printMemOffs8")
++    return "0x01";
++  else if (PrintMethod == "printMemOffs16")
++    return "0x1234";
++  else if (PrintMethod == "printMemOffs32")
++    return "0x12345678";
++  else if (PrintMethod == "printMemOffs64")
++    return "0x123456789abcdef0";
++  else
++    llvm_unreachable("Unkonw memory print method!");
++}
++
++static std::string genPCRelMemoryEnum(const CGIOperandList::OperandInfo *OI) {
++  StringRef PrintMethod = OI->PrinterMethodName;
++  if (PrintMethod == "printPCRelImm")
++    return "0x12345678";
++  else
++    llvm_unreachable("Unkonw memory print method!");
++}
++
++static std::string genRoundCtrlEnum(const CGIOperandList::OperandInfo *OI) {
++  StringRef PrintMethod = OI->PrinterMethodName;
++  if (PrintMethod == "printRoundingControl")
++    return "{rn-sae}";
++  else
++    llvm_unreachable("Unkonw memory print method!");
++}
++
++static std::string genEnumByOperandInfo(CodeGenTarget &CGT,
++                                        const CGIOperandList::OperandInfo *OI) {
++  if (OI->OperandType == "MCOI::OPERAND_REGISTER")
++    return genRegisterEnum(CGT.getRegBank(), OI);
++  else if (OI->OperandType == "MCOI::OPERAND_IMMEDIATE")
++    return genImmediateEnum(OI);
++  else if (OI->OperandType == "MCOI::OPERAND_MEMORY")
++    return genMemoryEnum(OI);
++  else if (OI->OperandType == "MCOI::OPERAND_PCREL")
++    return genPCRelMemoryEnum(OI);
++  else if (OI->OperandType == "X86::OPERAND_ROUNDING_CONTROL")
++    return genRoundCtrlEnum(OI);
++  else {
++    StringRef ValueName = OI->Rec->getName();
++    if (ValueName == "lea64mem" || ValueName == "lea64_32mem")
++      return genMemoryEnum(OI);
++    else {
++      PrintFatalError(OI->Rec->getLoc(), "Unknown operand!");
++    }
++  }
++}
++
++static void scanSchedRW(json::Object &JSchedRW, Record *SchedRW) {
++  JSchedRW["Name"] = SchedRW->getName();
++  JSchedRW["Type"] = SchedRW->getType()->getAsString();
++  if (SchedRW->isSubClassOf("WriteSequence")) {
++    json::Array Writes;
++    for (Record *SubWrite : SchedRW->getValueAsListOfDefs("Writes")) {
++      json::Object JSubWrite;
++      scanSchedRW(JSubWrite, SubWrite);
++      Writes.push_back(std::move(JSubWrite));
++    }
++    JSchedRW["Writes"] = std::move(Writes);
++    JSchedRW["Repeat"] = SchedRW->getValueAsInt("Repeat");
++  }
++}
++
++static std::string genAsmEnum(const MatchableInfo *MI, CodeGenTarget &Target) {
++  // Reset Global index.
++  RegIdx = 1;
++
++  StringMap<std::string> OpName2Enum;
++  std::string AsmEnum(MI->Mnemonic.str());
++  StringRef AsmString = MI->AsmString;
++  unsigned ASIdx = MI->Mnemonic.size();
++  for (auto &Op : MI->AsmOperands) {
++    size_t TokIdx = AsmString.find(Op.Token, ASIdx);
++    assert(TokIdx != StringRef::npos && "Token not exist");
++    AsmEnum += AsmString.substr(ASIdx, TokIdx - ASIdx);
++    ASIdx = TokIdx + Op.Token.size();
++    if (Op.Class->Kind == ClassInfo::Token || Op.SingletonReg) {
++      AsmEnum += Op.Token.str();
++      continue;
++    }
++
++    std::string &OpEnum = OpName2Enum[Op.SrcOpName];
++    if (!OpEnum.size()) {
++      const CGIOperandList::OperandInfo *OI = nullptr;
++      if (MI->DefRec.is<const CodeGenInstruction *>()) {
++        for (auto &OpInfo :
++             MI->DefRec.get<const CodeGenInstruction *>()->Operands)
++          if (OpInfo.Name == Op.OrigSrcOpName) {
++            OI = &OpInfo;
++            break;
++          }
++      } else {
++        const CodeGenInstAlias *CGA =
++            MI->DefRec.get<const CodeGenInstAlias *>();
++        for (unsigned I = 0, E = CGA->ResultOperands.size(); I != E; I++) {
++          auto &RO = CGA->ResultOperands[I];
++          if (RO.isRecord() && RO.getName() == Op.OrigSrcOpName) {
++            OI = &(MI->getResultInst()
++                       ->Operands[CGA->ResultInstOperandIndex[I].first]);
++            break;
++          }
++        }
++      }
++      assert(OI && "Can't found OperandInfo");
++      OpEnum = genEnumByOperandInfo(Target, OI);
++      if (OpEnum == "%cr1")
++        OpEnum = "%cr0";
++      AsmEnum += OpEnum;
++    }
++  }
++  assert(ASIdx == AsmString.size());
++  return AsmEnum;
++}
++
++namespace llvm {
++
++void EmitX86InstSchedInfo(RecordKeeper &RK, raw_ostream &OS) {
++  CodeGenTarget Target(RK);
++  if (Target.getInstNamespace() != "X86")
++    return;
++
++  Record *AsmParser = Target.getAsmParser();
++  assert(AsmParser->getValueAsBit("HasMnemonicFirst"));
++
++  // Compute the information on the instructions to match.
++  AsmMatcherInfo Info(AsmParser, Target, RK);
++  Info.buildInfo(/*AllowX86NoPseudo=*/true);
++
++  // Sort the instruction table using the partial order on classes. We use
++  // stable_sort to ensure that ambiguous instructions are still
++  // deterministically ordered.
++  llvm::stable_sort(
++      Info.Matchables,
++      [](const std::unique_ptr<MatchableInfo> &a,
++         const std::unique_ptr<MatchableInfo> &b) { return *a < *b; });
++
++  Record *AsmVariant = RK.getDef("ATTAsmParserVariant");
++  AsmVariantInfo Variant;
++  Variant.RegisterPrefix = AsmVariant->getValueAsString("RegisterPrefix");
++  Variant.TokenizingCharacters =
++      AsmVariant->getValueAsString("TokenizingCharacters");
++  Variant.SeparatorCharacters =
++      AsmVariant->getValueAsString("SeparatorCharacters");
++  Variant.BreakCharacters = AsmVariant->getValueAsString("BreakCharacters");
++  Variant.Name = AsmVariant->getValueAsString("Name");
++  Variant.AsmVariantNo = AsmVariant->getValueAsInt("Variant");
++
++  DenseMap<const CodeGenInstruction *, const MatchableInfo *> CGI2MI;
++  for (auto &MI : Info.Matchables) {
++    const CodeGenInstruction *ResultInst = MI->getResultInst();
++    if (MI->AsmVariantID == Variant.AsmVariantNo)
++      CGI2MI.insert(std::make_pair(ResultInst, MI.get()));
++  }
++
++  json::Object JRoot;
++  DenseMap<StringRef, std::string> Opc2AsmEnum;
++  for (const CodeGenInstruction *II : Target.getInstructionsByEnumValue()) {
++    if (!II->TheDef->getValueInit("SchedRW")->isComplete())
++      continue;
++
++    json::Object JInstInfo;
++    json::Array JSchedReads, JSchedWrites;
++    for (Record *SchedRW : II->TheDef->getValueAsListOfDefs("SchedRW")) {
++      if (SchedRW->isSubClassOf("SchedWrite")) {
++        json::Object JSchedWrite;
++        scanSchedRW(JSchedWrite, SchedRW);
++        JSchedWrites.push_back(std::move(JSchedWrite));
++      } else if (SchedRW->isSubClassOf("SchedRead")) {
++        json::Object JSchedRead;
++        scanSchedRW(JSchedRead, SchedRW);
++        JSchedReads.push_back(std::move(JSchedRead));
++      } else
++        llvm_unreachable("SchedRW should be SchedRead or SchedWrite");
++    }
++    JInstInfo["SchedReads"] = std::move(JSchedReads);
++    JInstInfo["SchedWrites"] = std::move(JSchedWrites);
++
++    if (CGI2MI.count(II)) {
++      const MatchableInfo *MI = CGI2MI[II];
++      json::Array JMode = json::Array({64, 32, 16});
++      for (auto *RF : MI->RequiredFeatures) {
++        StringRef ValueName = RF->TheDef->getName();
++        if (ValueName == "In16BitMode")
++          JMode = json::Array({16});
++        else if (ValueName == "In32BitMode")
++          JMode = json::Array({32});
++        else if (ValueName == "In64BitMode")
++          JMode = json::Array({64});
++        else if (ValueName == "Not16BitMode")
++          JMode = json::Array({64, 32});
++        else if (ValueName == "Not64BitMode")
++          JMode = json::Array({32, 16});
++        else
++          llvm_unreachable("Unknown required feature");
++      }
++
++      // In64BitMode in some X86 CG only instructions are intentionally omitted.
++      if (II->TheDef->getValue("hasREX_W") &&
++          II->TheDef->getValueAsBit("hasREX_W"))
++        JMode = json::Array({64});
++
++      std::string AsmEnum;
++      StringRef Opcode = II->TheDef->getName();
++      if (Opcode == "JCC_2" || Opcode == "JCC_4")
++        AsmEnum = Opc2AsmEnum["JCC_1"];
++      else
++        AsmEnum = genAsmEnum(MI, Target);
++      Opc2AsmEnum[Opcode] = AsmEnum;
++      JInstInfo["Modes"] = std::move(JMode);
++      JInstInfo["AsmString"] = AsmEnum;
++    }
++
++    JRoot[II->TheDef->getName()] = std::move(JInstInfo);
++  }
++  OS << formatv("{0:2}", json::Value(std::move(JRoot)));
++}
++
++} // end namespace llvm
++
++static TableGen::Emitter::Opt Y("gen-x86-inst-sched-info", EmitX86InstSchedInfo,
++                                "Generate instruction schedreadwrite info for x86 backend");
++
++//===----------------------------------------------------------------------===//
+-- 
+2.18.1
+

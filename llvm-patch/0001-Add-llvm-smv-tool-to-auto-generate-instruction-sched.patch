@@ -1,0 +1,215 @@
+From 41c5bef4f0a91d5cba759ce2339823fd0330016f Mon Sep 17 00:00:00 2001
+From: Haohai Wen <haohai.wen@intel.com>
+Date: Thu, 3 Jun 2021 13:03:46 +0800
+Subject: [PATCH 1/4] Add llvm-smv tool to auto generate instruction scheduler
+ info.
+
+Change-Id: Idb4e392883cdbb99a5b4a6a12b559e970f88b000
+---
+ llvm/tools/llvm-smv/CMakeLists.txt |  16 +++
+ llvm/tools/llvm-smv/llvm-smv.cpp   | 170 +++++++++++++++++++++++++++++
+ 2 files changed, 186 insertions(+)
+ create mode 100644 llvm/tools/llvm-smv/CMakeLists.txt
+ create mode 100644 llvm/tools/llvm-smv/llvm-smv.cpp
+
+diff --git a/llvm/tools/llvm-smv/CMakeLists.txt b/llvm/tools/llvm-smv/CMakeLists.txt
+new file mode 100644
+index 000000000000..b869f5d4dc55
+--- /dev/null
++++ b/llvm/tools/llvm-smv/CMakeLists.txt
+@@ -0,0 +1,16 @@
++include_directories(include)
++
++set(LLVM_LINK_COMPONENTS
++  AllTargetsDescs
++  AllTargetsInfos
++  MCA
++  MC
++  MCParser
++  Support
++  )
++
++add_llvm_tool(llvm-smv
++  llvm-smv.cpp
++  )
++
++set(LLVM_SMV_SOURCE_DIR ${CURRENT_SOURCE_DIR})
+diff --git a/llvm/tools/llvm-smv/llvm-smv.cpp b/llvm/tools/llvm-smv/llvm-smv.cpp
+new file mode 100644
+index 000000000000..d6560ff276fc
+--- /dev/null
++++ b/llvm/tools/llvm-smv/llvm-smv.cpp
+@@ -0,0 +1,170 @@
++#include "llvm/MC/MCRegisterInfo.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/MCA/InstrBuilder.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/ErrorOr.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/Host.h"
++#include "llvm/Support/InitLLVM.h"
++#include "llvm/Support/JSON.h"
++#include "llvm/Support/TargetSelect.h"
++#include "llvm/Support/ToolOutputFile.h"
++#include "llvm/Support/WithColor.h"
++
++using namespace llvm;
++
++static cl::OptionCategory ToolOptions("Tool Options");
++static cl::opt<std::string>
++    ArchName("march",
++             cl::desc("Target architecture. "
++                      "See -version for available targets"),
++             cl::cat(ToolOptions));
++
++static cl::opt<std::string>
++    TripleName("mtriple",
++               cl::desc("Target triple. See -version for available targets"),
++               cl::cat(ToolOptions));
++
++static cl::opt<std::string>
++    MCPU("mcpu",
++         cl::desc("Target a specific cpu type (-mcpu=help for details)"),
++         cl::value_desc("cpu-name"), cl::cat(ToolOptions), cl::init("native"));
++
++static cl::opt<std::string> MATTR("mattr",
++                                  cl::desc("Additional target features."),
++                                  cl::cat(ToolOptions));
++
++static cl::opt<std::string> OutputFilename("o", cl::desc("Output filename"),
++                                           cl::init("-"), cl::cat(ToolOptions),
++                                           cl::value_desc("filename"));
++
++namespace {
++
++const Target *getTarget(const char *ProgName) {
++  if (TripleName.empty())
++    TripleName = Triple::normalize(sys::getDefaultTargetTriple());
++  Triple TheTriple(TripleName);
++
++  // Get the target specific parser.
++  std::string Error;
++  const Target *TheTarget =
++      TargetRegistry::lookupTarget(ArchName, TheTriple, Error);
++  if (!TheTarget) {
++    errs() << ProgName << ": " << Error;
++    return nullptr;
++  }
++
++  // Update TripleName with the updated triple from the target lookup.
++  TripleName = TheTriple.str();
++
++  // Return the found target.
++  return TheTarget;
++}
++
++ErrorOr<std::unique_ptr<ToolOutputFile>> getOutputStream() {
++  if (OutputFilename == "")
++    OutputFilename = "-";
++  std::error_code EC;
++  auto Out = std::make_unique<ToolOutputFile>(OutputFilename, EC,
++                                              sys::fs::OF_TextWithCRLF);
++  if (!EC)
++    return std::move(Out);
++  return EC;
++}
++} // end of anonymous namespace
++
++int main(int argc, char **argv) {
++  InitLLVM X(argc, argv);
++
++  // Initialize targets.
++  InitializeAllTargetInfos();
++  InitializeAllTargetMCs();
++
++  // Enable printing of available targets when flag --version is specified.
++  cl::AddExtraVersionPrinter(TargetRegistry::printRegisteredTargetsForVersion);
++
++  // Parse flags and initialize target options.
++  cl::ParseCommandLineOptions(argc, argv,
++                              "llvm machine code performance analyzer.\n");
++
++  // Get the target from the triple. If a triple is not specified, then select
++  // the default triple for the host. If the triple doesn't correspond to any
++  // registered target, then exit with an error message.
++  const char *ProgName = argv[0];
++  const Target *TheTarget = getTarget(ProgName);
++  if (!TheTarget)
++    return 1;
++
++  // GetTarget() may replaced TripleName with a default triple.
++  // For safety, reconstruct the Triple object.
++  Triple TheTriple(TripleName);
++
++  if (MCPU == "native")
++    MCPU = std::string(llvm::sys::getHostCPUName());
++
++  // Now initialize the output file.
++  auto OF = getOutputStream();
++  if (std::error_code EC = OF.getError()) {
++    WithColor::error() << EC.message() << '\n';
++    return 1;
++  }
++  std::unique_ptr<ToolOutputFile> TOF = std::move(*OF);
++  auto &OS = TOF->os();
++
++  std::unique_ptr<MCSubtargetInfo> STI(
++      TheTarget->createMCSubtargetInfo(TripleName, MCPU, MATTR));
++  assert(STI && "Unable to create subtarget info!");
++  if (!STI->isCPUStringValid(MCPU))
++    return 1;
++
++  std::unique_ptr<MCInstrInfo> MCII(TheTarget->createMCInstrInfo());
++  assert(MCII && "Unable to create instruction info!");
++
++  const MCSchedModel &SM = STI->getSchedModel();
++  json::Object JRoot;
++
++  for (unsigned I = 1, E = MCII->getNumOpcodes(); I < E; ++I) {
++    const MCInstrDesc &MCID = MCII->get(I);
++
++    // Then obtain the scheduling class information from the instruction.
++    unsigned SchedClassID = MCID.getSchedClass();
++    bool IsVariant = SM.getSchedClassDesc(SchedClassID)->isVariant();
++
++    // Skip checking variant schedclass.
++    if (IsVariant) {
++      errs() << "unable to resolve scheduling class for write variant: "
++             << MCII->getName(I) << "\n";
++      continue;
++    }
++
++    // Skip checking unsupported instructions.
++    const MCSchedClassDesc &SCDesc = *SM.getSchedClassDesc(SchedClassID);
++    if (SCDesc.NumMicroOps == MCSchedClassDesc::InvalidNumMicroOps) {
++      errs() << "found an unsupported instruction: " << MCII->getName(I)
++             << "\n";
++      continue;
++    }
++
++    json::Object JInstInfo;
++    JInstInfo["NumUops"] = SCDesc.NumMicroOps;
++    JInstInfo["Latency"] = MCSchedModel::computeInstrLatency(*STI, SCDesc);
++    JInstInfo["RThroughput"] =
++        MCSchedModel::getReciprocalThroughput(*STI, SCDesc);
++
++    json::Object JWriteProcRes;
++    const MCWriteProcResEntry *Idx = STI->getWriteProcResBegin(&SCDesc);
++    const MCWriteProcResEntry *End = STI->getWriteProcResEnd(&SCDesc);
++    for (; Idx != End; ++Idx) {
++      StringRef Name = SM.getProcResource(Idx->ProcResourceIdx)->Name;
++      JWriteProcRes[Name] = Idx->Cycles;
++    }
++    JInstInfo["WriteRes"] = std::move(JWriteProcRes);
++    JRoot[MCII->getName(I)] = std::move(JInstInfo);
++  }
++
++  OS << formatv("{0:2}", json::Value(std::move(JRoot)));
++  TOF->keep();
++  return 0;
++}
+-- 
+2.18.1
+

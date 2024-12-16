@@ -1,0 +1,66 @@
+From 4828401cf5c76198577d57afa24459d231a08662 Mon Sep 17 00:00:00 2001
+From: Haohai Wen <haohai.wen@intel.com>
+Date: Wed, 16 Mar 2022 15:23:14 +0800
+Subject: [PATCH 2/4] Support --debug-only=print-opcode to llvm-mc
+
+This option will emit all possbile matched opcodes.
+---
+ llvm/utils/TableGen/AsmMatcherEmitter.cpp | 25 ++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/utils/TableGen/AsmMatcherEmitter.cpp b/llvm/utils/TableGen/AsmMatcherEmitter.cpp
+index 8f3c98b4303f..0b7d784844e2 100644
+--- a/llvm/utils/TableGen/AsmMatcherEmitter.cpp
++++ b/llvm/utils/TableGen/AsmMatcherEmitter.cpp
+@@ -3547,7 +3547,7 @@ void AsmMatcherEmitter::run(raw_ostream &OS) {
+   // Finally, build the match function.
+   OS << "unsigned " << Target.getName() << ClassName << "::\n"
+      << "MatchInstructionImpl(const OperandVector &Operands,\n";
+-  OS << "                     MCInst &Inst,\n";
++  OS << "                     MCInst &GenuineInst,\n";
+   if (ReportMultipleNearMisses)
+     OS << "                     SmallVectorImpl<NearMissInfo> *NearMisses,\n";
+   else
+@@ -3634,9 +3634,16 @@ void AsmMatcherEmitter::run(raw_ostream &OS) {
+   OS << "  if (MnemonicRange.first == MnemonicRange.second)\n";
+   OS << "    return Match_MnemonicFail;\n\n";
+ 
++  OS << "  bool PrintOpcodes = false;\n";
++  OS << "  DEBUG_WITH_TYPE(\"print-opcode\", PrintOpcodes = true);\n";
++  OS << "  bool MatchOnce = false;\n";
++  OS << "  MCInst FakeInst(GenuineInst);\n";
++  OS << "  std::string MatchedOpcodes;\n";
+   OS << "  for (const MatchEntry *it = MnemonicRange.first, "
+      << "*ie = MnemonicRange.second;\n";
+   OS << "       it != ie; ++it) {\n";
++  OS << "    MCInst *RealInst = MatchOnce ? &FakeInst : &GenuineInst;\n";
++  OS << "    MCInst &Inst = *RealInst;\n";
+   OS << "    const FeatureBitset &RequiredFeatures = "
+         "FeatureBitsets[it->RequiredFeaturesIdx];\n";
+   OS << "    bool HasRequiredFeatures =\n";
+@@ -3964,6 +3971,22 @@ void AsmMatcherEmitter::run(raw_ostream &OS) {
+   OS << "    DEBUG_WITH_TYPE(\n";
+   OS << "        \"asm-matcher\",\n";
+   OS << "        dbgs() << \"Opcode result: complete match, selecting this opcode\\n\");\n";
++  OS << "\n";
++  OS << "    if (!MatchOnce) {\n";
++  OS << "      MatchOnce = true;\n";
++  OS << "      if (!PrintOpcodes)\n";
++  OS << "        return Match_Success;\n";
++  OS << "      MatchedOpcodes = MII.getName(it->Opcode).str();\n";
++  OS << "    } else {\n";
++  OS << "      FakeInst.clear();\n";
++  OS << "      MatchedOpcodes += std::string(\",\") + MII.getName(it->Opcode).str();\n";
++  OS << "    }\n";
++  // OS << "    return Match_Success;\n";
++  OS << "  }\n\n";
++
++  OS << "  if (MatchOnce) {\n";
++  OS << "    if (PrintOpcodes)\n";
++  OS << "      outs() << MatchedOpcodes;\n";
+   OS << "    return Match_Success;\n";
+   OS << "  }\n\n";
+ 
+-- 
+2.18.1
+
